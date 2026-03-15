@@ -1,0 +1,94 @@
+version: 0.2
+
+env:
+  variables:
+    IMAGE_REPO_NAME: "lambda-web-adapter"
+    LAMBDA_FUNCTION_NAME: "strands-web-adapter"
+    LAMBDA_ALIAS_NAME: "live"
+
+phases:
+  install:
+    commands:
+      - echo "Installing dependencies..."
+      - apt-get update -y && apt-get install -y jq
+
+  build:
+    commands:
+      - echo "Starting Lambda deployment with provisioned concurrency..."
+
+      - |
+        for target in $TARGETS; do
+          account_id=$(echo $target | cut -d':' -f1)
+          target_region=$(echo $target | cut -d':' -f2)
+
+          echo "=============================="
+          echo "Deploying to account: $account_id, region: $target_region"
+          echo "=============================="
+
+          TARGET_ECR_URI="$account_id.dkr.ecr.$target_region.amazonaws.com/$IMAGE_REPO_NAME"
+
+          echo "Assuming role in target account..."
+          CREDS=$(aws sts assume-role \
+            --role-arn arn:aws:iam::$account_id:role/Ai-house-trust-role-lambda-ecr \
+            --role-session-name "DeployLambda-$account_id")
+
+          export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)
+
+          echo "Fetching image digest..."
+          IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name $IMAGE_REPO_NAME \
+            --image-ids imageTag=strands-agent \
+            --query "imageDetails[0].imageDigest" \
+            --output text \
+            --region $target_region)
+
+          FULL_IMAGE_URI="$TARGET_ECR_URI@$IMAGE_DIGEST"
+
+          echo "Updating Lambda function code..."
+          aws lambda update-function-code \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --image-uri "$FULL_IMAGE_URI" \
+            --region $target_region
+
+          echo "Waiting for Lambda update to complete..."
+          while true; do
+            status=$(aws lambda get-function-configuration \
+              --function-name $LAMBDA_FUNCTION_NAME \
+              --region $target_region \
+              --query 'LastUpdateStatus' \
+              --output text 2>/dev/null)
+
+            if [ "$status" = "Successful" ]; then
+              echo "Lambda update completed."
+              break
+            elif [ "$status" = "Failed" ]; then
+              echo "Lambda update failed."
+              exit 1
+            else
+              echo "Update in progress or unauthorized... waiting 10s"
+              sleep 10
+            fi
+          done
+
+          echo "Publishing new Lambda version..."
+          VERSION=$(aws lambda publish-version \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --region $target_region \
+            --query 'Version' --output text)
+
+          echo "Updating alias '${LAMBDA_ALIAS_NAME}' to point to version $VERSION"
+          aws lambda update-alias \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --name $LAMBDA_ALIAS_NAME \
+            --function-version $VERSION \
+            --region $target_region \
+            --routing-config 'AdditionalVersionWeights={}'
+
+          echo "Deployment to $account_id in $target_region complete."
+
+          unset AWS_ACCESS_KEY_ID
+          unset AWS_SECRET_ACCESS_KEY
+          unset AWS_SESSION_TOKEN
+        done
