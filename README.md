@@ -60,6 +60,3 @@ Invokes the Strands Agent with the provided prompt and configuration.
 - Ensure your AWS credentials and permissions are correctly configured.
 - The agent supports both streaming (SSE) and non-streaming responses based on the `enable_thinking` flag.
 - Extend or modify handlers/services as needed for your use case.
-
-## License
-[MIT](LICENSE)
